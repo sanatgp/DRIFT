@@ -15,6 +15,8 @@ Install dependencies:
     pip install -r requirements.txt
 
 ## Quick Start
+Simple benchmarking script:
+    mpirun -np 4 python benchmark.py
 
 Profile on synthetic data (no dataset needed):
 
