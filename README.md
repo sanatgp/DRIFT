@@ -1,11 +1,8 @@
 # DRIFT
 
-# DRIFT
-
 **Direct Reduced Fourier Transforms for Distributed Spectral Neural Operators**
 
-A communication-avoiding algorithm for distributed Fourier Neural Operators (FNOs) that replaces all-to-all collectives in the distributed FFT with local partial DFT and AllReduce/AllGather. Produces numerically identical spectral coefficients with up to 47× forward-pass speedup.
-
+A communication-avoiding algorithm for distributed Fourier Neural Operators (FNOs).
 ## Requirements
 
 - NVIDIA GPUs with CUDA
