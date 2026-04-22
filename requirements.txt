@@ -1,6 +1,7 @@
-torch>=2.0
-mpi4py
-cupy-cuda12x
-numpy
-h5py
+torch==2.1.0
+cupy-cuda12x==13.6.0
+mpi4py==4.1.1
+numpy>=1.26
+h5py>=3.10
+matplotlib>=3.8
 distdl

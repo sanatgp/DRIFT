@@ -1,16 +1,16 @@
 """
-DRIFT vs DFNO — Training Convergence Sanity Check
+DRIFT vs DFNO — Epoch-based Training Convergence
 
-Runs 100 training iterations on PDEBench 3D NS with both DFNO and DRIFT,
-logs per-iteration loss, and saves the loss curves for plotting.
-
-Both models use identical architecture (lift, proj, width, modes, blocks)
-and the same optimizer/LR. The ONLY difference is the spectral transform.
-If DRIFT is mathematically exact, the loss curves should overlap.
+Runs 100 epochs on PDEBench 3D NS with both DFNO and DRIFT.
+Each epoch iterates over all training samples. After each epoch,
+evaluates on the test set and logs:
+  - Epoch-averaged train MSE loss
+  - Test relative L2 error
+  - Per-epoch wall-clock time
 
 Usage:
-  mpirun -np 4 python train_convergence.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
-  mpirun -np 4 python train_convergence.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt --iters 200 --lr 1e-3
+  mpirun -np 16 python train_epochs.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
+  mpirun -np 16 python train_epochs.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt --epochs 100 --lr 1e-3
 """
 
 import argparse
@@ -34,9 +34,10 @@ def parse_args():
     p.add_argument("--modes", type=int, nargs=4, default=[8, 8, 8, 8])
     p.add_argument("--width", type=int, default=20)
     p.add_argument("--blocks", type=int, default=4)
-    p.add_argument("--iters", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--scheduler", action="store_true", help="Use cosine annealing LR scheduler")
     return p.parse_args()
 
 
@@ -69,6 +70,12 @@ def make_partition(ws, shape, modes_z):
     return (1, 1, px, py, 1, 1)
 
 
+def rel_l2_dist(pred, target, comm):
+    d = comm.allreduce(((pred - target) ** 2).sum().item(), op=MPI.SUM)
+    n = comm.allreduce((target ** 2).sum().item(), op=MPI.SUM)
+    return (d / (n + 1e-12)) ** 0.5
+
+
 def main():
     args = parse_args()
     comm, rank, ws, device = setup()
@@ -77,31 +84,34 @@ def main():
     nx, ny, nz = data['grid']
     t_in, t_out = data['t_in'], data['t_out']
     n_channels = data['x_train'].shape[1]
-
-    n_samples = min(10, data['x_train'].shape[0])
-    x_all = data['x_train'][:n_samples].contiguous()  # [N, V, X, Y, Z, t_in]
-    y_all = data['y_train'][:n_samples].contiguous()  # [N, V, X, Y, Z, t_out]
+    
+    
+    n_train = min(40, data['x_train'].shape[0])
+  #  n_train = data['x_train'].shape[0]
+    n_test = data['x_test'].shape[0]
+    x_train = data['x_train'].contiguous()
+    y_train = data['y_train'].contiguous()
+    x_test = data['x_test'].contiguous()
+    y_test = data['y_test'].contiguous()
 
     P_shape = make_partition(ws, [nx, ny, nz], args.modes[2])
     Px, Py = P_shape[2], P_shape[3]
     lx, ly = nx // Px, ny // Py
 
     if rank == 0:
-        print("=" * 65)
-        print("  DRIFT vs DFNO — Training Convergence Check")
-        print(f"  Ranks: {ws}   Device: {device}")
+        print("  DRIFT vs DFNO — Epoch-based Training")
+        print(f"  GPUs: {ws}   Device: {device}")
         print(f"  Grid: ({nx},{ny},{nz})  Channels: {n_channels}")
         print(f"  Modes: {args.modes}  Width: {args.width}  Blocks: {args.blocks}")
-        print(f"  Iters: {args.iters}  LR: {args.lr}  Seed: {args.seed}")
-        print(f"  Training samples: {n_samples}")
-        print(f"  Data: {args.data_file}")
-        print("=" * 65)
+        print(f"  Epochs: {args.epochs}  LR: {args.lr}  Seed: {args.seed}")
+        print(f"  Train samples: {n_train}  Test samples: {n_test}")
+        print(f"  Partition: Px={Px}, Py={Py}, lx={lx}, ly={ly}")
+
 
     _, P_x, _ = create_standard_partitions(P_shape)
 
     def slice_local(tensor, idx):
-        """Slice one sample and extract local spatial partition."""
-        s = tensor[idx:idx + 1]  # [1, V, X, Y, Z, T]
+        s = tensor[idx:idx + 1]
         if Py == 1:
             return s[:, :, rank * lx:(rank + 1) * lx].contiguous().to(device)
         else:
@@ -112,11 +122,8 @@ def main():
     in_shape = (1, n_channels, nx, ny, nz, t_in)
     dfno = DistributedFNO(P_x, in_shape, t_out, args.width, tuple(args.modes),
                           num_blocks=args.blocks, device=device, dtype=torch.float32)
-    dfno.train()
-    opt_dfno = torch.optim.Adam(dfno.parameters(), lr=args.lr)
-    loss_fn_dfno = dnn.DistributedMSELoss(P_x)
 
-    torch.manual_seed(args.seed)  # same init
+    torch.manual_seed(args.seed)
     block_shape = (1, args.width, lx, ly, nz, t_out)
 
     class DRIFTModel(torch.nn.Module):
@@ -144,146 +151,155 @@ def main():
             return x
 
     drift = DRIFTModel()
-    drift.train()
+
+    opt_dfno = torch.optim.Adam(dfno.parameters(), lr=args.lr)
     opt_drift = torch.optim.Adam(drift.parameters(), lr=args.lr)
+    loss_fn_dfno = dnn.DistributedMSELoss(P_x)
     loss_fn_drift = dnn.DistributedMSELoss(P_x)
 
-    dfno_p = sum(p.numel() for p in dfno.parameters())
-    drift_p = sum(p.numel() for p in drift.parameters())
+    if args.scheduler:
+        sched_dfno = torch.optim.lr_scheduler.CosineAnnealingLR(opt_dfno, T_max=args.epochs)
+        sched_drift = torch.optim.lr_scheduler.CosineAnnealingLR(opt_drift, T_max=args.epochs)
+
     if rank == 0:
-        print(f"    DFNO params/GPU:  {dfno_p:,}")
-        print(f"    DRIFT params/GPU: {drift_p:,}")
+        dfno_p = sum(p.numel() for p in dfno.parameters())
+        drift_p = sum(p.numel() for p in drift.parameters())
+        print(f"  DFNO params/GPU:  {dfno_p:,}")
+        print(f"  DRIFT params/GPU: {drift_p:,}")
 
-    if rank == 0: print(f"\n[3] Training ({args.iters} iterations)...")
+    rng = np.random.RandomState(args.seed)
 
-    dfno_losses = []
-    drift_losses = []
-    dfno_times = []
-    drift_times = []
+    log = {
+        'dfno_train_loss': [], 'drift_train_loss': [],
+        'dfno_val_l2': [], 'drift_val_l2': [],
+        'dfno_epoch_time': [], 'drift_epoch_time': [],
+    }
 
-    for it in range(args.iters):
-        idx = it % n_samples
-        x_local = slice_local(x_all, idx)
-        y_local = slice_local(y_all, idx)
+    if rank == 0:
+        print(f"\n{'Epoch':>6} | {'DFNO loss':>10} {'DFNO L2':>9} {'DFNO t':>8} | "
+              f"{'DRIFT loss':>11} {'DRIFT L2':>9} {'DRIFT t':>8} | {'Speedup':>8}")
+        print("-" * 90)
 
-        # Target: take first channel of y to match DFNO's 1-channel output
-        # DFNO outputs (1, 1, lx, ly, nz, t_out), y_local is (1, V, lx, ly, nz, t_out)
-        y_target = y_local[:, 0:1].contiguous()
+    for epoch in range(args.epochs):
+        order = rng.permutation(n_train)
 
-        comm.Barrier()
-        torch.cuda.synchronize()
+        dfno.train()
+        dfno_epoch_loss = 0.0
+        comm.Barrier(); torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        opt_dfno.zero_grad()
-        pred_dfno = dfno(x_local)
-        loss_dfno = loss_fn_dfno(pred_dfno, y_target)
-        loss_dfno.backward()
-        opt_dfno.step()
-
-        torch.cuda.synchronize()
-        comm.Barrier()
-        dt_dfno = time.perf_counter() - t0
-
-        comm.Barrier()
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
-        opt_drift.zero_grad()
-        pred_drift = drift(x_local)
-        loss_drift = loss_fn_drift(pred_drift, y_target)
-        loss_drift.backward()
-        opt_drift.step()
-
-        torch.cuda.synchronize()
-        comm.Barrier()
-        dt_drift = time.perf_counter() - t0
-
-        l_dfno = loss_dfno.item()
-        l_drift = loss_drift.item()
-        dfno_losses.append(l_dfno)
-        drift_losses.append(l_drift)
-        dfno_times.append(dt_dfno)
-        drift_times.append(dt_drift)
-
-        if rank == 0 and (it % 10 == 0 or it == args.iters - 1):
-            print(f"  iter {it:4d}  |  DFNO loss: {l_dfno:.6f} ({dt_dfno*1000:.0f}ms)  "
-                  f"|  DRIFT loss: {l_drift:.6f} ({dt_drift*1000:.0f}ms)")
-
-    dfno.eval()
-    drift.eval()
-
-    n_test = min(data['x_test'].shape[0], 10)
-    dfno_test_l2 = []
-    drift_test_l2 = []
-
-    with torch.no_grad():
-        for ti in range(n_test):
-            x_local = slice_local(data['x_test'], ti)
-            y_local = slice_local(data['y_test'], ti)
+        for i in range(n_train):
+            idx = int(order[i])
+            x_local = slice_local(x_train, idx)
+            y_local = slice_local(y_train, idx)
             y_target = y_local[:, 0:1].contiguous()
 
-            pred_dfno = dfno(x_local)
-            pred_drift = drift(x_local)
+            opt_dfno.zero_grad()
+            pred = dfno(x_local)
+            loss = loss_fn_dfno(pred, y_target)
+            loss.backward()
+            opt_dfno.step()
+            dfno_epoch_loss += loss.item()
 
-            def rel_l2_dist(pred, target):
-                d = comm.allreduce(((pred - target) ** 2).sum().item(), op=MPI.SUM)
-                n = comm.allreduce((target ** 2).sum().item(), op=MPI.SUM)
-                return (d / (n + 1e-12)) ** 0.5
+        torch.cuda.synchronize(); comm.Barrier()
+        dt_dfno = time.perf_counter() - t0
+        dfno_epoch_loss /= n_train
 
-            dfno_test_l2.append(rel_l2_dist(pred_dfno, y_target))
-            drift_test_l2.append(rel_l2_dist(pred_drift, y_target))
+        drift.train()
+        drift_epoch_loss = 0.0
+        comm.Barrier(); torch.cuda.synchronize()
+        t0 = time.perf_counter()
 
-    dfno_test_l2 = np.array(dfno_test_l2)
-    drift_test_l2 = np.array(drift_test_l2)
+        for i in range(n_train):
+            idx = int(order[i])
+            x_local = slice_local(x_train, idx)
+            y_local = slice_local(y_train, idx)
+            y_target = y_local[:, 0:1].contiguous()
+
+            opt_drift.zero_grad()
+            pred = drift(x_local)
+            loss = loss_fn_drift(pred, y_target)
+            loss.backward()
+            opt_drift.step()
+            drift_epoch_loss += loss.item()
+
+        torch.cuda.synchronize(); comm.Barrier()
+        dt_drift = time.perf_counter() - t0
+        drift_epoch_loss /= n_train
+
+        if args.scheduler:
+            sched_dfno.step()
+            sched_drift.step()
+
+        dfno.eval()
+        drift.eval()
+        dfno_l2_list = []
+        drift_l2_list = []
+
+        with torch.no_grad():
+            for ti in range(n_test):
+                x_local = slice_local(x_test, ti)
+                y_local = slice_local(y_test, ti)
+                y_target = y_local[:, 0:1].contiguous()
+
+                pred_dfno = dfno(x_local)
+                pred_drift = drift(x_local)
+
+                dfno_l2_list.append(rel_l2_dist(pred_dfno, y_target, comm))
+                drift_l2_list.append(rel_l2_dist(pred_drift, y_target, comm))
+
+        dfno_val_l2 = np.mean(dfno_l2_list)
+        drift_val_l2 = np.mean(drift_l2_list)
+
+        log['dfno_train_loss'].append(dfno_epoch_loss)
+        log['drift_train_loss'].append(drift_epoch_loss)
+        log['dfno_val_l2'].append(dfno_val_l2)
+        log['drift_val_l2'].append(drift_val_l2)
+        log['dfno_epoch_time'].append(dt_dfno)
+        log['drift_epoch_time'].append(dt_drift)
+
+        speedup = dt_dfno / dt_drift
+
+        if rank == 0:
+            print(f"  {epoch:4d}  | {dfno_epoch_loss:>10.4f} {dfno_val_l2:>9.4f} {dt_dfno:>7.1f}s | "
+                  f"{drift_epoch_loss:>11.4f} {drift_val_l2:>9.4f} {dt_drift:>7.1f}s | {speedup:>7.1f}x")
 
     if rank == 0:
-        print(f"    DFNO  test rel L2: {dfno_test_l2.mean():.4f} ± {dfno_test_l2.std():.4f}")
-        print(f"    DRIFT test rel L2: {drift_test_l2.mean():.4f} ± {drift_test_l2.std():.4f}")
+        dfno_times = np.array(log['dfno_epoch_time'])
+        drift_times = np.array(log['drift_epoch_time'])
+        total_speedup = dfno_times.sum() / drift_times.sum()
 
-    if rank == 0:
-        dfno_losses = np.array(dfno_losses)
-        drift_losses = np.array(drift_losses)
-        dfno_times = np.array(dfno_times)
-        drift_times = np.array(drift_times)
 
-        print(f"\n{'=' * 65}")
-        print(f"  TRAINING CONVERGENCE RESULTS ({args.iters} iterations)")
-        print(f"{'=' * 65}")
-        print(f"  {'':25s} {'DFNO':>12s} {'DRIFT':>12s}")
-        print(f"  {'-' * 50}")
-        print(f"  {'Final loss':25s} {dfno_losses[-1]:>12.6f} {drift_losses[-1]:>12.6f}")
-        print(f"  {'Min loss':25s} {dfno_losses.min():>12.6f} {drift_losses.min():>12.6f}")
-        print(f"  {'Test rel L2 (mean)':25s} {dfno_test_l2.mean():>12.4f} {drift_test_l2.mean():>12.4f}")
-        print(f"  {'Test rel L2 (std)':25s} {dfno_test_l2.std():>12.4f} {drift_test_l2.std():>12.4f}")
-        print(f"  {'Mean iter time (ms)':25s} {dfno_times.mean()*1000:>10.1f}   {drift_times.mean()*1000:>10.1f}")
-        print(f"  {'Training speedup':25s} {'':>12s} {dfno_times.mean()/drift_times.mean():>11.1f}x")
-        print(f"{'=' * 65}")
+        print(f"  FINAL RESULTS ({args.epochs} epochs, P={ws})")
+        print(f"  {'':28s} {'DFNO':>12s} {'DRIFT':>12s}")
+        print(f"  {'-' * 55}")
+        print(f"  {'Final train loss':28s} {log['dfno_train_loss'][-1]:>12.4f} {log['drift_train_loss'][-1]:>12.4f}")
+        print(f"  {'Final test rel L2':28s} {log['dfno_val_l2'][-1]:>12.4f} {log['drift_val_l2'][-1]:>12.4f}")
+        print(f"  {'Best test rel L2':28s} {min(log['dfno_val_l2']):>12.4f} {min(log['drift_val_l2']):>12.4f}")
+        print(f"  {'Mean epoch time (s)':28s} {dfno_times.mean():>12.1f} {drift_times.mean():>12.1f}")
+        print(f"  {'Total training time':28s} {dfno_times.sum():>11.1f}s {drift_times.sum():>11.1f}s")
+        print(f"  {'Training speedup':28s} {'':>12s} {total_speedup:>11.1f}x")
 
         os.makedirs("results", exist_ok=True)
-        fn = f"results/convergence_P{ws}_{nx}x{ny}x{nz}.json"
-        with open(fn, 'w') as f:
+        tag = f"P{ws}_{nx}x{ny}x{nz}_{args.epochs}ep"
+
+        fn_json = f"results/epochs_{tag}.json"
+        with open(fn_json, 'w') as f:
             json.dump({
                 "config": {
                     "world_size": ws, "grid": [nx, ny, nz],
                     "modes": args.modes, "width": args.width, "blocks": args.blocks,
-                    "iters": args.iters, "lr": args.lr, "seed": args.seed,
-                    "n_samples": n_samples,
+                    "epochs": args.epochs, "lr": args.lr, "seed": args.seed,
+                    "n_train": n_train, "n_test": n_test,
+                    "scheduler": args.scheduler,
                 },
-                "dfno_losses": dfno_losses.tolist(),
-                "drift_losses": drift_losses.tolist(),
-                "dfno_times_ms": (dfno_times * 1000).tolist(),
-                "drift_times_ms": (drift_times * 1000).tolist(),
-                "dfno_test_rel_l2": dfno_test_l2.tolist(),
-                "drift_test_rel_l2": drift_test_l2.tolist(),
+                **{k: v if not isinstance(v, np.ndarray) else v.tolist() for k, v in log.items()},
             }, f, indent=2)
-        print(f"  Saved: {fn}")
+        print(f"  Saved: {fn_json}")
 
-        # Save numpy for easy plotting
-        np.savez(f"results/convergence_P{ws}_{nx}x{ny}x{nz}.npz",
-                 dfno_losses=dfno_losses, drift_losses=drift_losses,
-                 dfno_times=dfno_times, drift_times=drift_times,
-                 dfno_test_l2=dfno_test_l2, drift_test_l2=drift_test_l2)
-        print(f"  Saved: results/convergence_P{ws}_{nx}x{ny}x{nz}.npz")
+        fn_npz = f"results/epochs_{tag}.npz"
+        np.savez(fn_npz, **{k: np.array(v) for k, v in log.items()})
+        print(f"  Saved: {fn_npz}")
 
 
 if __name__ == "__main__":

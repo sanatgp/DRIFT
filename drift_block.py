@@ -8,10 +8,7 @@
 #   AllReduce: 2M·c·(P-1)/P bytes  (same as ReduceScatter + AllGather)
 #   AllGather: M·c·(P-1)/P bytes
 #   Total: 3M·c·(P-1)/P bytes
-#
-# Model parallelism: W_spec sharded across GPUs (S_local = S/P per GPU)
-# Data parallelism: spatial domain partitioned along x-dimension
-# When P=1: collapses to local-only (no communication)
+
 
 import math
 import time
@@ -106,7 +103,6 @@ class _AllReduceFunc(torch.autograd.Function):
     def backward(ctx, grad_output):
         if ctx.comm.Get_size() <= 1:
             return grad_output, None
-        # Adjoint of AllReduce(SUM) is AllReduce(SUM)
         result, _ = _raw_allreduce_gpu(grad_output, ctx.comm)
         return result, None
 
@@ -127,8 +123,6 @@ class _AllGatherFunc(torch.autograd.Function):
     def backward(ctx, grad_output):
         if ctx.comm.Get_size() <= 1:
             return grad_output, None, None
-        # Adjoint of AllGather is ReduceScatter
-        # Implement as AllReduce + local slice
         comm = ctx.comm
         shard_dim = ctx.shard_dim
         world_size = comm.Get_size()
@@ -371,7 +365,6 @@ class PartialDFTFNOBlock(nn.Module):
             0, 1, 4, 5, 2, 3
         ).contiguous()
 
-        # === Phase 8: inverse pDFT on Z ===
         if self._has_z:
             spatial = spatial.permute(0, 1, 2, 3, 5, 4).contiguous()
             shape_pre = spatial.shape

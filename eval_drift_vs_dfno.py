@@ -1,9 +1,15 @@
 """
 DRIFT vs DFNO — PDEBench 3D Navier-Stokes Evaluation
 
+Reports per-phase timings with named sections:
+  DRIFT: pDFT(T), pDFT(Z), pDFT(YX), AllReduce, SpecConv, AllGather,
+         iPDFT(XY), iPDFT(Z), iPDFT(T), Lift/Proj, Linear bypass, GeLU
+  DFNO:  R1 (all-to-all), FFT1, R2 (all-to-all), FFT2, SpecConv,
+         iFFT1, R3 (all-to-all), iFFT2, R4 (all-to-all), Lift/Proj
+
 Usage:
-  mpirun -np 4  python eval_pdebench.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt --modes 8 8 8 8
-  mpirun -np 16 python eval_pdebench.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt --modes 8 8 8 8
+  mpirun -np 4  python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt --modes 8 8 8 8
+  mpirun -np 16 python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt --modes 8 8 8 8
 """
 
 import argparse, json, os, time, math
@@ -62,6 +68,8 @@ def parse_args():
     p.add_argument("--trials", type=int, default=20)
     p.add_argument("--n-channels", type=int, default=None)
     p.add_argument("--save-viz", action="store_true")
+    p.add_argument("--save-json", action="store_true",
+                   help="Save per-phase breakdown to results/phases_P{ws}.json")
     return p.parse_args()
 
 
@@ -100,6 +108,7 @@ def copy_blinear(dst, src):
             dst.W.data.copy_(src.W.data)
             dst.b.data.copy_(src.b.data)
 
+
 def profiled_dfno_block(block, x, prof, idx):
     p = f"dfno/blk{idx}"
     prof.start(f"{p}/linear"); y0 = block.linear(x); prof.stop()
@@ -137,6 +146,7 @@ def profiled_dfno_block(block, x, prof, idx):
     prof.start(f"{p}/R4"); y = block.R4(y); prof.stop()
     prof.start(f"{p}/gelu"); out = F.gelu(y0 + y); prof.stop()
     return out
+
 
 def profiled_dfno_forward(model, x, prof):
     prof.start("dfno/total_fwd")
@@ -249,10 +259,36 @@ def profiled_drift_forward(model, x, prof):
     prof.stop()
     return out
 
+
 def rel_l2(a, b, comm):
     d = comm.allreduce(((a - b) ** 2).sum().item(), op=MPI.SUM)
     n = comm.allreduce((b ** 2).sum().item(), op=MPI.SUM)
     return math.sqrt(d / (n + 1e-12))
+
+
+def reassemble_2d(chunks, Px, Py, nx, ny):
+    if Py == 1:
+        return np.concatenate(chunks, axis=1)
+    lx = nx // Px
+    ly = ny // Py
+    rows = []
+    for cx in range(Px):
+        row_chunks = [chunks[cx * Py + cy] for cy in range(Py)]
+        rows.append(np.concatenate(row_chunks, axis=2))
+    return np.concatenate(rows, axis=1)
+
+
+def aggregate_phases(summary, prefix, phase_tags, num_blocks):
+    """Sum mean_ms across blocks for each listed phase tag."""
+    out = {}
+    for tag in phase_tags:
+        total = 0.0
+        for i in range(num_blocks):
+            key = f"{prefix}/blk{i}/{tag}"
+            if key in summary:
+                total += summary[key]["mean_ms"]
+        out[tag] = round(total, 2)
+    return out
 
 
 def main():
@@ -280,17 +316,16 @@ def main():
     if rank == 0:
         print(f"DRIFT vs DFNO | P={ws} | Grid=({nx},{ny},{nz}) | "
               f"Modes={args.modes} | Width={args.width} | Blocks={args.blocks}")
+        print(f"Partition: Px={Px}, Py={Py}, lx={lx}, ly={ly}")
 
     _, P_x, _ = create_standard_partitions(P_shape)
     in_shape = (1, n_channels, nx, ny, nz, t_in)
 
-    # Build DFNO
     torch.manual_seed(12345)
     dfno = DistributedFNO(P_x, in_shape, t_out, args.width, tuple(args.modes),
                           num_blocks=args.blocks, device=device, dtype=torch.float32)
     dfno.eval()
 
-    # Build DRIFT
     block_shape = (1, args.width, lx, ly, nz, t_out)
 
     class DRIFTModel(torch.nn.Module):
@@ -320,7 +355,6 @@ def main():
     drift = DRIFTModel()
     drift.eval()
 
-    # Sync shared weights
     with torch.no_grad():
         copy_blinear(drift.lift_t, dfno.linear1)
         copy_blinear(drift.lift_c, dfno.linear2)
@@ -329,14 +363,12 @@ def main():
         for i in range(len(dfno.blocks)):
             copy_blinear(drift.blocks[i].linear, dfno.blocks[i].linear)
 
-    # Viz: override output projection 128→5
     if args.save_viz:
         dfno.linear4 = BroadcastedLinear(P_x, 128, n_channels, dim=1, device=device)
         drift.proj2 = BroadcastedLinear(P_x, 128, n_channels, dim=1, device=device)
         with torch.no_grad():
             copy_blinear(drift.proj2, dfno.linear4)
 
-    # Correctness: zero spectral weights, full model
     with torch.no_grad():
         for blk in dfno.blocks:
             for w in blk.weights:
@@ -351,16 +383,13 @@ def main():
         print(f"Correctness: rel L2 = {err:.2e} ({'PASS' if err < 1e-5 else 'FAIL'})")
 
     if args.save_viz:
-        y_d_cpu = y_dfno[0].cpu()
-        y_r_cpu = y_drift[0].cpu()
-        x_in_cpu = x_local[0].cpu()
-        y_d_list = comm.gather(y_d_cpu.numpy(), root=0)
-        y_r_list = comm.gather(y_r_cpu.numpy(), root=0)
-        x_in_list = comm.gather(x_in_cpu.numpy(), root=0)
+        y_d_list = comm.gather(y_dfno[0].cpu().numpy(), root=0)
+        y_r_list = comm.gather(y_drift[0].cpu().numpy(), root=0)
+        x_in_list = comm.gather(x_local[0].cpu().numpy(), root=0)
         if rank == 0:
-            y_d_full = np.concatenate(y_d_list, axis=1)
-            y_r_full = np.concatenate(y_r_list, axis=1)
-            x_in_full = np.concatenate(x_in_list, axis=1)
+            y_d_full = reassemble_2d(y_d_list, Px, Py, nx, ny)
+            y_r_full = reassemble_2d(y_r_list, Px, Py, nx, ny)
+            x_in_full = reassemble_2d(x_in_list, Px, Py, nx, ny)
             os.makedirs("results", exist_ok=True)
             viz_fn = f"results/viz_P{ws}_{nx}x{ny}x{nz}.npz"
             z_mid = nz // 2
@@ -369,7 +398,7 @@ def main():
                      dfno=y_d_full[:, :, :, z_mid, 0],
                      drift=y_r_full[:, :, :, z_mid, 0],
                      error=np.abs(y_d_full[:, :, :, z_mid, 0] - y_r_full[:, :, :, z_mid, 0]),
-                     grid=[nx, ny, nz], rel_l2=err,
+                     grid=[nx, ny, nz], rel_l2=err, Px=Px, Py=Py,
                      var_names=['density', 'vx', 'vy', 'vz', 'pressure'])
             print(f"Saved: {viz_fn}")
         dfno.linear4 = BroadcastedLinear(P_x, 128, 1, dim=1, device=device)
@@ -413,6 +442,25 @@ def main():
     sp_fwd = dfno_fwd / max(drift_fwd, 1e-9)
     sp_total = (dfno_fwd + dfno_bwd) / max(drift_fwd + drift_bwd, 1e-9)
 
+    DRIFT_PHASES = [
+        "linear", "pdft_t", "pdft_z", "pdft_yx",
+        "allreduce", "spec_conv", "allgather",
+        "ipdft_xy", "ipdft_z", "ipdft_t", "gelu",
+    ]
+    DFNO_PHASES = [
+        "linear", "R1", "fft1", "R2", "fft2",
+        "spec_conv", "ifft1", "R3", "ifft2", "R4", "gelu",
+    ]
+    drift_phases = aggregate_phases(summary, "drift", DRIFT_PHASES, args.blocks)
+    dfno_phases = aggregate_phases(summary, "dfno", DFNO_PHASES, args.blocks)
+
+    drift_liftproj = round(
+        summary["drift/lift1"]["mean_ms"] + summary["drift/lift2"]["mean_ms"]
+        + summary["drift/proj1"]["mean_ms"] + summary["drift/proj2"]["mean_ms"], 2)
+    dfno_liftproj = round(
+        summary["dfno/lift1"]["mean_ms"] + summary["dfno/lift2"]["mean_ms"]
+        + summary["dfno/proj1"]["mean_ms"] + summary["dfno/proj2"]["mean_ms"], 2)
+
     if rank == 0:
         g = f"{nx}x{ny}x{nz}"
         print(f"\n{'='*60}")
@@ -429,7 +477,45 @@ def main():
         print(f"  Total speedup:    {sp_total:.1f}x")
         print(f"{'='*60}")
 
-        print(f"\n  Per-block:")
+        print(f"\n  DRIFT per-phase (summed across {args.blocks} blocks, ms):")
+        phase_labels_drift = {
+            "pdft_t":    "pDFT (T)",
+            "pdft_z":    "pDFT (Z)",
+            "pdft_yx":   "pDFT (Y,X)",
+            "allreduce": "AllReduce",
+            "spec_conv": "Spectral conv",
+            "allgather": "AllGather",
+            "ipdft_xy":  "iPDFT (X,Y)",
+            "ipdft_z":   "iPDFT (Z)",
+            "ipdft_t":   "iPDFT (T)",
+            "linear":    "Linear bypass",
+            "gelu":      "GeLU",
+        }
+        for tag in DRIFT_PHASES:
+            if drift_phases[tag] > 0:
+                print(f"    {phase_labels_drift[tag]:<18s} {drift_phases[tag]:>8.2f}")
+        print(f"    {'Lift + Proj':<18s} {drift_liftproj:>8.2f}")
+
+        print(f"\n  DFNO per-phase (summed across {args.blocks} blocks, ms):")
+        phase_labels_dfno = {
+            "R1":        "R1 (all-to-all)",
+            "fft1":      "FFT (m-dims)",
+            "R2":        "R2 (all-to-all)",
+            "fft2":      "FFT (y-dims)",
+            "spec_conv": "Spectral conv",
+            "ifft1":     "iFFT (y-dims)",
+            "R3":        "R3 (all-to-all)",
+            "ifft2":     "iFFT (m-dims)",
+            "R4":        "R4 (all-to-all)",
+            "linear":    "Linear bypass",
+            "gelu":      "GeLU",
+        }
+        for tag in DFNO_PHASES:
+            if dfno_phases[tag] > 0:
+                print(f"    {phase_labels_dfno[tag]:<18s} {dfno_phases[tag]:>8.2f}")
+        print(f"    {'Lift + Proj':<18s} {dfno_liftproj:>8.2f}")
+
+        print(f"\n  Per-block comm/compute:")
         for i in range(args.blocks):
             for mname, ctags in [("DFNO", DFNO_COMM), ("DRIFT", DRIFT_COMM)]:
                 pfx = f"{mname.lower()}/blk{i}"
@@ -437,20 +523,6 @@ def main():
                 bc = sum(summary[k]["mean_ms"] for k in bk if any(t in k for t in ctags))
                 bp = sum(summary[k]["mean_ms"] for k in bk if not any(t in k for t in ctags))
                 print(f"    blk{i} {mname:<6} comm={bc:>7.1f}ms  compute={bp:>7.1f}ms")
-
-#        os.makedirs("results", exist_ok=True)
-#        fn = f"results/pdebench_P{ws}_{g}.json"
-#        with open(fn, 'w') as f:
-#            json.dump({
-#                "config": {"world_size": ws, "grid": [nx, ny, nz],
-#                           "modes": args.modes, "width": args.width, "blocks": args.blocks},
-#                "dfno_fwd_ms": round(dfno_fwd, 1), "dfno_bwd_ms": round(dfno_bwd, 1),
-#                "drift_fwd_ms": round(drift_fwd, 1), "drift_bwd_ms": round(drift_bwd, 1),
-#                "speedup_fwd": round(sp_fwd, 1), "speedup_total": round(sp_total, 1),
-#                "dfno_comm_pct": round(100*dfno_comm/dfno_fwd, 1),
-#                "drift_comm_pct": round(100*drift_comm/drift_fwd, 1),
-#                "rel_l2": float(f"{err:.2e}"),
-#            }, f, indent=2)
 
 if __name__ == "__main__":
     main()
