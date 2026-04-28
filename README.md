@@ -45,7 +45,7 @@ Compares DRIFT's partial-DFT spectral coefficients against FFT+truncation, and t
 ```bash
 mpirun -np 16 python plot_correctness.py \
     --data-file ./data/ns3d_128x128x128_tin5_tout16.pt \
-    --modes 8 8 8 16 --sample 4 --channel 1
+    --sample 4 --channel 1
 ```
 
 Produces `fig_correctness.pdf` with the spectral coefficient comparison (relative Frobenius error) and the distributed full-model comparison.
@@ -56,12 +56,10 @@ Runs both DFNO and DRIFT on the PDEBench data with 5 warm-up and 20 timed iterat
 
 ```bash
 mpirun -np 4 python eval_drift_vs_dfno.py \
-    --data-file ./data/ns3d_128x128x128_tin5_tout16.pt \
-    --modes 8 8 8 16
+    --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
 
 mpirun -np 32 python eval_drift_vs_dfno.py \
-    --data-file ./data/ns3d_128x128x128_tin5_tout16.pt \
-    --modes 8 8 8 16
+    --data-file ./data/ns3d_128x128x128_tin5_tout16.pt 
 ```
 
 Pass `--save-json` to write the per-phase breakdown to `results/phases_P{ws}_{grid}.json`.
