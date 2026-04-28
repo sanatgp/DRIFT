@@ -2,7 +2,8 @@
 
 **Direct Reduced Fourier Transforms for Distributed Spectral Neural Operators**
 
-A communication-avoiding algorithm for distributed Fourier Neural Operators (FNOs). 
+A communication-avoiding algorithm for distributed Fourier Neural Operators (FNOs).
+
 ## Requirements
 
 - NVIDIA GPUs with CUDA 12.x
@@ -14,7 +15,6 @@ Install Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-
 
 ## Data
 
@@ -34,7 +34,7 @@ python generate_ns3d_datasets.py \
     --t-in 5 --t-out 16
 ```
 
-This writes `./data/ns3d_128x128x128_tin5_tout16.pt`. Smaller grid variants used for strong/weak scaling are obtained by slicing or downsampling the native $128^3$ data at load time; no additional downloads are required.
+This writes `./data/ns3d_128x128x128_tin5_tout16.pt`. Smaller grid variants used for strong/weak scaling are obtained by slicing or downsampling the native 128^3 data at load time; no additional downloads are required.
 
 ## Experiments
 
@@ -50,23 +50,42 @@ mpirun -np 16 python plot_correctness.py \
 
 Produces `fig_correctness.pdf` with the spectral coefficient comparison (relative Frobenius error) and the distributed full-model comparison.
 
-### Performance benchmarks (Fig. 2, Table V, Figs. 8--11, Table I)
+### Performance benchmarks (Fig. 2, Table V, Figs. 8--11)
 
-Runs both DFNO and DRIFT on the PDEBench data with 5 warm-up and 20 timed iterations per configuration, recording per-phase timings for each model (partial DFT, AllReduce, AllGather, spectral convolution, linear bypass, lift/projection for DRIFT; repartitions $R_1$--$R_4$, FFT, iFFT, spectral convolution, lift/projection for DFNO):
+Runs both DFNO and DRIFT on the PDEBench data with 5 warm-up and 20 timed iterations per configuration, recording per-phase timings for each model (partial DFT, AllReduce, AllGather, spectral convolution, linear bypass, lift/projection for DRIFT, Repartitions R1-R4, FFT, iFFT, spectral convolution, lift/projection for DFNO):
 
 ```bash
-mpirun -np 4 python eval_drift_vs_dfno.py \
-    --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
-
-mpirun -np 32 python eval_drift_vs_dfno.py \
-    --data-file ./data/ns3d_128x128x128_tin5_tout16.pt 
+mpirun -np 4  python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
+mpirun -np 8  python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
+mpirun -np 16 python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
+mpirun -np 32 python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
 ```
 
-Pass `--save-json` to write the per-phase breakdown to `results/phases_P{ws}_{grid}.json`.
+Each run writes `results/eval_P{ws}.json` with timings consumed by the analysis scripts below.
+
+### Auxiliary analyses (Tables I, II, III)
+
+After running the benchmarks above, fit the alpha-beta communication model and reproduce Table I:
+
+```bash
+python ab_validate.py --results-dir results
+```
+
+Reproduce the per-stage gemm vs cuFFT FLOP comparison (Table II):
+
+```bash
+python cufft_compare.py
+```
+
+Reproduce the dimension-ordering analysis (Table III):
+
+```bash
+python dimention_ordering.py
+```
 
 ### Training convergence (Fig. 12)
 
-Trains DFNO and DRIFT for 100 epochs with matched Adam hyperparameters, matched random initialization, and identical per-epoch sample ordering. Logs per-epoch loss, test relative $L_2$ error, and wall-clock time:
+Trains DFNO and DRIFT for 100 epochs with matched Adam hyperparameters, matched random initialization, and identical per-epoch sample ordering. Logs per-epoch loss, test relative L2 error, and wall-clock time:
 
 ```bash
 mpirun -np 16 python train_convergence.py \
