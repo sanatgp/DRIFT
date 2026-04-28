@@ -7,9 +7,11 @@ Reports per-phase timings with named sections:
   DFNO:  R1 (all-to-all), FFT1, R2 (all-to-all), FFT2, SpecConv,
          iFFT1, R3 (all-to-all), iFFT2, R4 (all-to-all), Lift/Proj
 
+Saves results/eval_P{ws}.json with timings consumed by ab_validate.py.
+
 Usage:
-  mpirun -np 4  python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt --modes 8 8 8 8
-  mpirun -np 16 python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt --modes 8 8 8 8
+  mpirun -np 4  python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt 
+  mpirun -np 16 python eval_drift_vs_dfno.py --data-file ./data/ns3d_128x128x128_tin5_tout16.pt
 """
 
 import argparse, json, os, time, math
@@ -67,9 +69,11 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--trials", type=int, default=20)
     p.add_argument("--n-channels", type=int, default=None)
-    p.add_argument("--save-viz", action="store_true")
-    p.add_argument("--save-json", action="store_true",
-                   help="Save per-phase breakdown to results/phases_P{ws}.json")
+    p.add_argument("--save-viz", action="store_true",
+                   help="Save z-midplane numpy slices for plot_correctness.py")
+    p.add_argument("--no-save", action="store_true",
+                   help="Skip saving results JSON (saved by default)")
+    p.add_argument("--results-dir", default="results")
     return p.parse_args()
 
 
@@ -390,8 +394,8 @@ def main():
             y_d_full = reassemble_2d(y_d_list, Px, Py, nx, ny)
             y_r_full = reassemble_2d(y_r_list, Px, Py, nx, ny)
             x_in_full = reassemble_2d(x_in_list, Px, Py, nx, ny)
-            os.makedirs("results", exist_ok=True)
-            viz_fn = f"results/viz_P{ws}_{nx}x{ny}x{nz}.npz"
+            os.makedirs(args.results_dir, exist_ok=True)
+            viz_fn = f"{args.results_dir}/viz_P{ws}_{nx}x{ny}x{nz}.npz"
             z_mid = nz // 2
             np.savez(viz_fn,
                      input=x_in_full[:, :, :, z_mid, 0],
@@ -523,6 +527,37 @@ def main():
                 bc = sum(summary[k]["mean_ms"] for k in bk if any(t in k for t in ctags))
                 bp = sum(summary[k]["mean_ms"] for k in bk if not any(t in k for t in ctags))
                 print(f"    blk{i} {mname:<6} comm={bc:>7.1f}ms  compute={bp:>7.1f}ms")
+
+        if not args.no_save:
+            os.makedirs(args.results_dir, exist_ok=True)
+            out_fn = f"{args.results_dir}/eval_P{ws}.json"
+            payload = {
+                "world_size": ws,
+                "grid": [nx, ny, nz],
+                "modes": args.modes,
+                "width": args.width,
+                "blocks": args.blocks,
+                "Px": Px,
+                "Py": Py,
+                "trials": args.trials,
+                "warmup": args.warmup,
+                "rel_l2": err,
+                "dfno_fwd_ms": dfno_fwd,
+                "dfno_bwd_ms": dfno_bwd,
+                "dfno_comm_ms": dfno_comm,
+                "drift_fwd_ms": drift_fwd,
+                "drift_bwd_ms": drift_bwd,
+                "drift_comm_ms": drift_comm,
+                "fwd_speedup": round(sp_fwd, 2),
+                "total_speedup": round(sp_total, 2),
+                "drift_phases": {**drift_phases, "lift_proj": drift_liftproj},
+                "dfno_phases": {**dfno_phases, "lift_proj": dfno_liftproj},
+                "raw_summary": summary,
+            }
+            with open(out_fn, "w") as f:
+                json.dump(payload, f, indent=2)
+            print(f"\n  Saved: {out_fn}")
+
 
 if __name__ == "__main__":
     main()
